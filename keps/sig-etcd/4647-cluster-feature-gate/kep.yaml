@@ -2,6 +2,7 @@ title: Feature Gate in etcd
 kep-number: 4647
 authors:
   - "@siyuanfoundation"
+  - "@serathius"
   - "@stackbaek"
   - "@henrybear327"
 owning-sig: sig-etcd
