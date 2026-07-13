@@ -1,0 +1,36 @@
+title: DRA Hardware Metrics Collection
+kep-number: 6123
+authors:
+  - "@sizhang"
+owning-sig: sig-node
+participating-sigs:
+  - sig-instrumentation
+  - sig-scheduling
+status: provisional
+creation-date: 2026-07-13
+reviewers:
+  - TBD
+approvers:
+  - TBD
+
+# The target maturity stage in the current dev cycle for this KEP.
+stage: alpha
+
+# The most recent milestone for which work toward delivery of this KEP has been done.
+latest-milestone: "v1.36"
+
+# The milestone at which this feature was, or is targeted to be, at each stage.
+milestone:
+  alpha: "v1.36"
+
+# Feature gate name and components
+feature-gates:
+  - name: DRAHardwareMetrics
+    components:
+      - kubelet
+disable-supported: true
+
+metrics:
+  - container_accelerator_duty_cycle_ratio
+  - container_accelerator_memory_working_set_bytes
+  - container_accelerator_memory_total_bytes
