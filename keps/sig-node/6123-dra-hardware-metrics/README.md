@@ -58,8 +58,26 @@ To collect hardware metrics like GPU/TPU utilization, users are forced to instal
 1. **Operational Complexity**: Managing separate daemonsets, service monitors, and configs for every hardware class.
 2. **Namespace/Metadata Attributing**: Re-associating physical device metrics with Pod and Container namespaces/names is complex, error-prone, and requires scraping agents to query the Kubelet PodResources API or K8s API server under high privilege.
 3. **Autoscaling Fragmentation**: Standard autoscalers like the Horizontal Pod Autoscaler (HPA) cannot easily scale on accelerator metrics without deploying additional pipelines (e.g., Prometheus, Prometheus Adapter, Custom Metrics APIs).
+4. **Lack of Cluster Health & Reliability Visibility**: Core Kubernetes scheduling and node-management controllers are completely blind to accelerator health. 
+   - **Silent Hardware Degradation**: Thermal throttling or hardware/bus errors can cause a GPU/TPU to run extremely slowly without crashing the container, wasting expensive resources.
+   - **Shared-Resource GPU OOMs**: Unlike CPU which throttles under load, GPU memory exhaustion causes immediate container crashes (OOMs). When multiple containers share a partitioned GPU, memory usage spikes can cause cascading pod failures.
+   - **"Zombie" Allocations**: A container's code can deadlock (e.g., in ML data loaders) while holding a GPU allocation, resulting in 0% utilization for hours while blocking other workloads from scheduling.
+
+Exposing native accelerator utilization and memory metrics allows automation tooling to detect these scenarios, quarantine unhealthy nodes, and evict deadlocked workloads, greatly improving cluster reliability.
 
 Leveraging DRA (Dynamic Resource Allocation), the standard and hardware-agnostic model for resource management in Kubernetes, we can establish a native, local metrics-scraping path between Kubelet and DRA drivers.
+
+### Historical Context (Comparison with KEP-1867)
+
+In Kubernetes v1.20 (via KEP-1867), built-in Kubelet `AcceleratorUsage` metrics were deprecated and subsequently removed. The primary drivers for that deprecation were:
+1. **Vendor Coupling**: The old implementation was tightly coupled to NVIDIA GPUs, relying on hardcoded NVIDIA Management Library (NVML) bindings inside cAdvisor. This introduced vendor-specific dependencies into core Kubernetes components.
+2. **Push for Out-of-Tree**: Sig-node introduced the PodResources API to offload metrics collection to third-party daemonsets (e.g., NVIDIA's `dcgm-exporter`), allowing vendors to customize and expose device metrics without changing Kubernetes core.
+
+This proposal (**KEP-6123**) introduces a new collection path that overcomes the limitations of the old system while strictly adhering to the architectural principles of KEP-1867:
+
+* **Strict Vendor Neutrality**: Kubelet does not compile, import, or invoke any vendor-specific libraries. The hardware-specific collection is done entirely out-of-tree inside the vendor's DRA driver. Kubelet only acts as a pass-through coordinator, calling a standardized, local gRPC socket (`DRAMetricsCollector`) and receiving generic, structured Protobuf metrics (`MetricFamily`).
+* **Simplifying the Autoscaling Pipeline**: While the PodResources API works well for long-term telemetry dashboards, it creates a high barrier of entry for native autoscaling (HPA), which requires deploying Prometheus and a Custom Metrics adapter. Exposing basic, hardware-agnostic metrics natively via `/metrics/resource` and Metrics Server fills this critical gap for automated scheduling and scaling.
+* **Unified Metadata Correlation**: By having Kubelet query the local driver directly, Kubernetes can automatically decorate hardware utilization metrics with Pod, Namespace, and Container metadata using in-memory local state, avoiding high-privilege out-of-tree API lookups.
 
 ### Goals
 
@@ -128,12 +146,24 @@ As a cluster administrator running ML training jobs, I want to view my GPU and T
 #### Horizontal Pod Autoscaler (HPA) scaling on GPU utilization
 As an application developer running inference services, I want to use HPA to scale my deployment up or down based on the average GPU memory utilization or GPU duty cycle of my containers, querying these metrics natively via `metrics.k8s.io`.
 
+#### Multi-Metric HPA Scaling (Request Latency with Hardware Guardrails)
+As an AI Platform Engineer running large LLM serving containers (like vLLM), I want to scale my deployment primarily based on request queue depth (concurrency). However, I also want to configure secondary HPA metrics using native `container_dra` GPU utilization and memory metrics. This serves as a critical safety guardrail to scale up preemptively if:
+- A user sends a batch of requests with extremely large context windows (high token count), which saturates the GPU's VRAM (KV Cache) and risks Out-of-Memory (OOM) pod crashes, even though the queue length itself is low.
+- The GPU experiences thermal throttling, reducing compute performance and increasing response latency for existing requests.
+By using native GPU memory and duty cycle metrics as safety backstops, I can ensure maximum service reliability and prevent container crashes.
+
 ### Risks and Mitigations
 
-* **Performance Impact on Kubelet**: Scraping metrics dynamically from gRPC plugins during `/metrics/resource` requests could introduce latency or block Kubelet if a driver hangs.
-  * *Mitigation*: Kubelet will invoke plugin gRPC calls with a strict, short timeout (e.g., 2 seconds). Kubelet can also perform passive caching, serving cached metrics if the plugin takes too long or fails.
-* **Malicious/Buggy Driver Payload**: An invalid OpenMetrics payload from a DRA driver could corrupt the Kubelet `/metrics/resource` output, breaking metrics-server scraping for the entire node.
-  * *Mitigation*: Kubelet will parse and validate the OpenMetrics output from the plugin before appending it. Kubelet will enforce a name prefix constraint (e.g., metric names must start with `container_dra_` or `node_dra_`) to prevent collisions with core K8s metrics, but will not restrict the names to a hardcoded list. If a plugin returns invalid metrics, Kubelet will drop that plugin's payload, log an error, and increment a `dra_metrics_scrape_error` metric, keeping the rest of the endpoint functioning.
+* **Impact on Kubelet Responsiveness (Node Health)**: Querying metrics over gRPC sockets synchronously during `/metrics/resource` HTTP scrapes is a major risk. If one or more DRA drivers block or hang, the Kubelet HTTP endpoint will timeout, which would block the collection of critical core CPU and Memory metrics for the entire node, causing the node to be marked `NotReady`.
+  * *Mitigation*: **Asynchronous Scraping & Caching**. Kubelet's `ResourceMetricsCollector` will never query DRA drivers synchronously inside the HTTP handler. Instead, it will run a non-blocking background goroutine that periodically polls (e.g., every 15 seconds) registered DRA drivers and writes to an in-memory cache. The HTTP handler will serve instantly (sub-millisecond) from this cache. If a driver hangs, the background routine will timeout (e.g. 2 seconds) and leave the cached metrics stale or empty, without impacting core Kubelet performance.
+* **Telemetry Cardinality Explosion (Cluster Health & Memory Safety)**: A misconfigured or buggy DRA driver could return thousands of metrics or excessive label pairs, causing Kubelet's memory footprint to balloon and potentially crashing downstream consumers like Metrics Server or Prometheus.
+  * *Mitigation*: **Telemetry Guardrails**. Kubelet will enforce strict limits on the incoming Protobuf metrics:
+    - Maximum of 50 metric families per ResourceClaim.
+    - Maximum of 10 label pairs per metric.
+    - Maximum length of 128 characters for metric names, label keys, and label values.
+    Any metric exceeding these limits will be dropped immediately, and a scrape error metric (`dra_metrics_scrape_errors_total`) will be incremented.
+* **Fault Isolation**: If a DRA driver crashes or its socket becomes unavailable, the failure must be contained.
+  * *Mitigation*: Kubelet catches any gRPC network errors or connection failures. If a driver socket is dead, Kubelet simply marks its cache entry as stale and schedules a delayed retry, keeping all other drivers and Kubelet operations completely unaffected.
 
 ## Design Details
 
@@ -186,7 +216,35 @@ message ClaimMetricsResponse {
   // utilizing the metadata provided in GetMetricsRequest.
   // Example payload:
   // container_dra_gpu_duty_cycle_ratio{namespace="default",pod="cuda-pod",container="cuda-container",claim_name="gpu-claim",claim_uid="...",device="gpu-0",driver="nvidia.com"} 0.85 1625841000000
-  bytes metrics_data = 2;
+  repeated MetricFamily metrics = 2;
+}
+
+message MetricFamily {
+  string name = 1;
+  string help = 2;
+  MetricType type = 3;
+  repeated Metric metrics = 4;
+}
+
+enum MetricType {
+  GAUGE = 0;
+  COUNTER = 1;
+}
+
+message Metric {
+  // Label pairs for the metric.
+  repeated LabelPair labels = 1;
+  
+  // The value of the metric.
+  double value = 2;
+  
+  // Optional timestamp in milliseconds. If omitted, Kubelet's scrape time is used.
+  int64 timestamp_ms = 3;
+}
+
+message LabelPair {
+  string name = 1;
+  string value = 2;
 }
 ```
 
@@ -197,15 +255,22 @@ During DRA plugin registration (handled by [DRAPluginManager](file:///usr/local/
 If supported, Kubelet registers a gRPC client to query metrics.
 
 #### Scraping and Aggregation Flow
-We will extend the `resourceMetricsCollector` in [resource_metrics.go](file:///usr/local/google/home/sizhang/Projects/k8s-core/kubernetes/pkg/kubelet/metrics/collectors/resource_metrics.go):
+Instead of querying plugins synchronously inside Kubelet's HTTP scrape endpoint handler, Kubelet will decouple the metric polling from metrics exposition to guarantee Kubelet responsiveness:
 
-1. **Active Pod Discovery**: Loop through active pods and check for allocated DRA claims.
-2. **Group by Driver**: Group `ResourceClaim` allocations by their managing DRA driver name.
-3. **Query Plugins**: For each driver that supports `DRAMetricsCollector`, Kubelet creates a `GetMetricsRequest` with the active claims, pod metadata, and container mapping.
-4. **Parse and Validate**: Parse the returned `metrics_data` bytes using `github.com/prometheus/prometheus/model/textparse` to verify the format, ensuring:
-   - Metric names conform to the prefix constraint: must start with `container_dra_` or `node_dra_` (for node-level metrics). This prevents the driver from spoofing or colliding with core Kubelet/CRI metrics.
-   - Required labels (`pod`, `namespace`, `container` [for container metrics], `driver`) match the request context.
-5. **Serve**: Expose the verified metrics inside Kubelet's `/metrics/resource` output.
+##### Background Polling Loop (Periodic)
+A background goroutine in `ResourceMetricsCollector` runs periodically (e.g. every 15 seconds) to scrape and cache metrics from all active plugins:
+1. **Active Pod Discovery**: Loops through active pods to discover assigned DRA `ResourceClaim`s.
+2. **Group by Driver**: Groups these claims by their managing DRA driver.
+3. **Query Plugins**: For each driver that supports `DRAMetricsCollector`, Kubelet creates a `GetMetricsRequest` and sends it to the driver's local socket with a short timeout (e.g. 2 seconds).
+4. **Validate & Enforce Guardrails**: Kubelet checks the returned `MetricFamily` slice directly to verify the payload schema, dropping any elements that:
+   - Exceed cardinality limits (max 50 metrics, max 10 labels, max 128 character strings).
+   - Violate name prefix constraints (`container_dra_*` or `node_dra_*`).
+5. **Inject Metadata & Update Cache**: Kubelet resolves and injects missing or mismatched core metadata labels (`pod`, `namespace`, `container`, `driver`) using its local pod registry. The validated metrics are stored in a thread-safe local cache, keyed by Pod/Container/Claim.
+
+##### HTTP Endpoint Serving (Scrape Time)
+When a client queries Kubelet's `/metrics/resource` endpoint:
+1. **Cache Read**: The `ResourceMetricsCollector` immediately reads from the thread-safe local cache (sub-millisecond operation).
+2. **Exposition**: Kubelet translates the cached structured metrics into the OpenMetrics format and writes them directly to the HTTP response, alongside core CPU and Memory metrics. If a cache entry is missing or stale (older than 60 seconds), it is ignored, ensuring Kubelet never blocks.
 
 #### Metrics Registration and Exposition
 Metrics will be dynamically registered at scrape time within the collector's `CollectWithStability` method.
@@ -241,12 +306,11 @@ For Kubelet to accept and expose container-scoped metrics, the driver must label
 
 ### Metrics Server Changes
 
-Because Metrics Server implements the structured Metrics API (`metrics.k8s.io`), it cannot dynamically expose arbitrary metrics via its standard endpoint.
+Because Metrics Server implements the Metrics API using the extensible `ResourceList` type, it can dynamically ingest and expose arbitrary hardware metrics.
 
 #### Scrape and Parsing Updates
 Metrics Server's client ([client.go](file:///usr/local/google/home/sizhang/Projects/k8s-core/metrics-server/pkg/scraper/client/resource/client.go)) will scrape `/metrics/resource` as usual.
-The parser in [decode.go](file:///usr/local/google/home/sizhang/Projects/k8s-core/metrics-server/pkg/scraper/client/resource/decode.go) will scan for metrics conforming to the recommended conventions (matching the patterns `container_dra_*_duty_cycle_ratio` and `container_dra_*_memory_*`).
-Other arbitrary metrics (e.g., temperature, error rates, custom vendor indicators) will be ignored by Metrics Server, but will remain available to full-fledged monitoring solutions (like Prometheus/Grafana) that scrape Kubelet directly.
+The parser in [decode.go](file:///usr/local/google/home/sizhang/Projects/k8s-core/metrics-server/pkg/scraper/client/resource/decode.go) will scan for any metrics carrying the prefix `container_dra_`. It will parse these metrics dynamically, converting the suffix into a resource key under the accelerator's `Usage` map (e.g. `nvidia.com/gpu_temperature_celsius` or `nvidia.com/gpu_duty_cycle_ratio`), and serializing the values as standard K8s `Quantity` types. This ensures any custom metric exposed by a DRA driver is natively available.
 
 #### Metrics API Extension (metrics.k8s.io/v1beta2)
 We propose extending the metrics schema in Metrics Server to support a new API version `metrics.k8s.io/v1beta2`.
@@ -270,19 +334,74 @@ type ContainerMetrics struct {
 }
 
 type AcceleratorMetrics struct {
-    // Unique device identifier
+    // Unique device identifier (e.g., gpu-0)
     Device string
     
-    // Managing DRA driver name
+    // Managing DRA driver name (e.g., nvidia.com)
     Driver string
     
-    // Standard hardware metrics mapped by the parser
-    Usage ResourceList // duty-cycle, memory-working-set, memory-total
+    // Dynamically populated map of resource metrics returned by the DRA driver
+    Usage ResourceList
 }
 ```
 If a pod uses multiple devices of different resource classes, Metrics Server aggregates the stats for each device separately.
 
-For advanced autoscaling using arbitrary metrics (e.g., scaling based on custom queue depths exposed by a custom accelerator), users should deploy Prometheus Adapter to feed those metrics from Prometheus to the Kubernetes Custom Metrics API (`custom.metrics.k8s.io`).
+#### Dynamic Metrics Mapping to ResourceList
+To support arbitrary metrics without API schema updates, Metrics Server will dynamically translate Kubelet's exposed metrics into `ResourceList` keys using the following rules:
+
+1. **Key Generation**: A metric named `container_dra_<metric_suffix>` from driver `<driver_name>` will be exposed under `Usage` with the key `<driver_name>/<metric_suffix>`.
+   - E.g., `container_dra_gpu_duty_cycle_ratio` from driver `nvidia.com` is mapped to `nvidia.com/gpu_duty_cycle_ratio`.
+   - E.g., `container_dra_tpu_hbm_temperature` from driver `google.com/tpu` is mapped to `google.com/tpu/hbm_temperature`.
+2. **Value Representation**: Since `ResourceList` values must be of type `Quantity`, floating-point metrics (like ratios) will be represented using standard milli-units (e.g., `0.85` becomes `850m`). Integers (like bytes or counts) will be represented directly as standard quantities.
+
+#### Autoscaling with HPA
+
+This dynamic mapping enables the Horizontal Pod Autoscaler (HPA) to scale on *any* arbitrary hardware metric exposed by a DRA driver natively through the resource metrics pipeline, without requiring an external metrics adapter (e.g. Prometheus Adapter) or modifications to the HPA controller.
+
+##### HPA Resource Metric Target Example
+Below is an HPA configuration scaling based on the dynamic GPU duty cycle metric of a container:
+
+```yaml
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: ml-inference-scaler
+  namespace: default
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: ml-inference-deployment
+  minReplicas: 1
+  maxReplicas: 10
+  metrics:
+  - type: ContainerResource
+    containerResource:
+      container: cuda-container
+      name: nvidia.com/gpu_duty_cycle_ratio  # Dynamic metric key from the DRA driver
+      target:
+        type: AverageValue
+        averageValue: 800m  # Scale when average GPU utilization exceeds 80% (800 milli-units)
+```
+
+##### HPA Controller Mechanics & Compatibility
+This integration functions out of the box because of the following core design details:
+
+1. **String-Based Resource Checking**: The Kubernetes HPA controller evaluates resource metrics by matching a generic string type (`v1.ResourceName` is defined as `type ResourceName string`). When the controller retrieves metric values via the resource client, it looks up the key in the container's `Usage` map:
+   ```go
+   // From: kubernetes/pkg/controller/podautoscaler/metrics/client.go
+   if val, resFound := c.Usage[resource]; resFound {
+       // val contains the matched Quantity
+   }
+   ```
+   Because Metrics Server dynamically populates `Usage` with keys like `nvidia.com/gpu_duty_cycle_ratio`, the lookup succeeds automatically.
+
+2. **Scaling on AverageValue (Raw Values)**: 
+   Containers request the resource device itself (e.g., `nvidia.com/gpu: 1`), not the metric namespace (e.g., `nvidia.com/gpu_duty_cycle_ratio`).
+   - If an HPA targets `AverageUtilization`, the HPA controller validates that the pod spec declares a matching request limit (`c.Resources.Requests[resource]`), returning an error if it is missing.
+   - To bypass this, autoscaling on dynamic metrics must target `AverageValue`. The HPA controller then calculates desired replicas via `GetRawResourceReplicas`, which skips requests parsing and directly calculates:
+     $$\text{desiredReplicas} = \text{ceil} \left( \text{currentReplicas} \times \frac{\text{actualUsage}}{\text{targetUsage}} \right)$$
+     This makes it fully compatible with custom metric formats.
 
 ## Graduation Criteria
 

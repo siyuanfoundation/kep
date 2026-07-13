@@ -31,6 +31,6 @@ feature-gates:
 disable-supported: true
 
 metrics:
-  - container_accelerator_duty_cycle_ratio
-  - container_accelerator_memory_working_set_bytes
-  - container_accelerator_memory_total_bytes
+  - container_dra_gpu_duty_cycle_ratio
+  - container_dra_gpu_memory_working_set_bytes
+  - container_dra_gpu_memory_total_bytes
