@@ -4,12 +4,13 @@
 - [Release Signoff Checklist](#release-signoff-checklist)
 - [Summary](#summary)
 - [Motivation](#motivation)
+  - [Why not the existing observability stack?](#why-not-the-existing-observability-stack)
   - [Goals](#goals)
   - [Non-Goals](#non-goals)
 - [Proposal](#proposal)
   - [User Stories](#user-stories)
-    - [Kubernetes AI Operator monitoring GPU/TPU utilization](#kubernetes-ai-operator-monitoring-gputpu-utilization)
     - [Horizontal Pod Autoscaler (HPA) scaling on GPU utilization](#horizontal-pod-autoscaler-hpa-scaling-on-gpu-utilization)
+    - [Multi-Metric HPA Scaling (Request Latency with Hardware Guardrails)](#multi-metric-hpa-scaling-request-latency-with-hardware-guardrails)
   - [Risks and Mitigations](#risks-and-mitigations)
 - [Design Details](#design-details)
   - [DRA Plugin gRPC API Changes](#dra-plugin-grpc-api-changes)
@@ -17,9 +18,9 @@
     - [Capability Detection](#capability-detection)
     - [Scraping and Aggregation Flow](#scraping-and-aggregation-flow)
     - [Metrics Registration and Exposition](#metrics-registration-and-exposition)
-  - [Standardized Metrics Format](#standardized-metrics-format)
-    - [Metric Definitions](#metric-definitions)
-    - [Labels](#labels)
+  - [Standardized Metric Set](#standardized-metric-set)
+    - [Allowed Metrics](#allowed-metrics)
+    - [Required Labels](#required-labels)
   - [Metrics Server Changes](#metrics-server-changes)
     - [Scrape and Parsing Updates](#scrape-and-parsing-updates)
     - [Metrics API Extension (metrics.k8s.io/v1beta2)](#metrics-api-extension-metricsk8siov1beta2)
@@ -48,24 +49,39 @@ Items marked with (R) are required *prior to targeting to a milestone / release*
 
 ## Summary
 
-This KEP proposes a standardized, hardware-agnostic metrics collection mechanism for Kubernetes using Dynamic Resource Allocation (DRA). The mechanism enables local DRA resource drivers to expose hardware utilization metrics (such as GPU/TPU active duty cycle, memory usage, etc.) to Kubelet. Kubelet aggregates these metrics, enriches them with pod and container metadata, and exposes them at the `/metrics/resource` endpoint. Metrics Server then scrapes Kubelet to gather and serve these accelerator metrics to Kubernetes autoscaling and scheduling components (e.g. HPA).
+This KEP closes a specific gap: Kubernetes has **no native, control-loop-consumable source of accelerator (GPU/TPU) utilization metrics**. Core components that already consume the `metrics.k8s.io` resource pipeline — most notably the Horizontal Pod Autoscaler (HPA) — can autoscale on CPU and memory out of the box, but cannot scale on GPU duty cycle or GPU memory without standing up a separate custom-metrics pipeline (Prometheus + Prometheus Adapter + `custom.metrics.k8s.io`).
+
+This KEP proposes a standardized, hardware-agnostic mechanism using Dynamic Resource Allocation (DRA) to fill that gap. Local DRA resource drivers optionally expose a small set of hardware-agnostic accelerator metrics (duty cycle, memory working set/total) to Kubelet over a local gRPC service. Kubelet enriches them with Pod/Container/Claim metadata using in-memory state and exposes them at `/metrics/resource`. Metrics Server then serves them through `metrics.k8s.io/v1beta2`, making them directly consumable by HPA via the existing resource-metrics path — **no external adapter required**.
+
+**This KEP is not an observability solution.** It is not a replacement for, and does not compete with, Prometheus, `dcgm-exporter`, or vendor telemetry stacks. Dashboards, alerting, and long-term/high-cardinality hardware telemetry remain the domain of those tools (see [Why not the existing observability stack?](#why-not-the-existing-observability-stack)).
 
 ## Motivation
 
-With the exponential growth of AI/ML workloads, accelerators like GPUs and TPUs have become critical components of Kubernetes clusters. However, Kubelet and Metrics Server currently only collect and expose CPU and memory metrics. 
+With the growth of AI/ML workloads, accelerators like GPUs and TPUs have become critical cluster resources. Yet Kubelet and Metrics Server only collect CPU and memory, so the metrics that Kubernetes' own control loops can consume stop at CPU/memory. This is fine for human-facing observability — teams already run Prometheus and `dcgm-exporter` for that — but it leaves a concrete, unaddressed gap for **automated, in-cluster consumers**.
 
-To collect hardware metrics like GPU/TPU utilization, users are forced to install and manage third-party sidecars and agents (such as NVIDIA's `dcgm-exporter` or custom TPU exporters). This setup introduces several problems:
-1. **Operational Complexity**: Managing separate daemonsets, service monitors, and configs for every hardware class.
-2. **Namespace/Metadata Attributing**: Re-associating physical device metrics with Pod and Container namespaces/names is complex, error-prone, and requires scraping agents to query the Kubelet PodResources API or K8s API server under high privilege.
-3. **Autoscaling Fragmentation**: Standard autoscalers like the Horizontal Pod Autoscaler (HPA) cannot easily scale on accelerator metrics without deploying additional pipelines (e.g., Prometheus, Prometheus Adapter, Custom Metrics APIs).
-4. **Lack of Cluster Health & Reliability Visibility**: Core Kubernetes scheduling and node-management controllers are completely blind to accelerator health. 
-   - **Silent Hardware Degradation**: Thermal throttling or hardware/bus errors can cause a GPU/TPU to run extremely slowly without crashing the container, wasting expensive resources.
-   - **Shared-Resource GPU OOMs**: Unlike CPU which throttles under load, GPU memory exhaustion causes immediate container crashes (OOMs). When multiple containers share a partitioned GPU, memory usage spikes can cause cascading pod failures.
-   - **"Zombie" Allocations**: A container's code can deadlock (e.g., in ML data loaders) while holding a GPU allocation, resulting in 0% utilization for hours while blocking other workloads from scheduling.
+The primary problem this KEP solves:
 
-Exposing native accelerator utilization and memory metrics allows automation tooling to detect these scenarios, quarantine unhealthy nodes, and evict deadlocked workloads, greatly improving cluster reliability.
+**Native accelerator autoscaling requires a parallel metrics pipeline.** To scale a Deployment on GPU utilization today, an operator must deploy and operate Prometheus, `prometheus-adapter`, and wire up `custom.metrics.k8s.io` — purely to feed a number back into HPA that Kubelet is already positioned to know. This is a high barrier of entry for a first-class capability (autoscaling on the resource the workload actually bottlenecks on), and it duplicates a pipeline solely to bridge accelerator metrics into HPA.
 
-Leveraging DRA (Dynamic Resource Allocation), the standard and hardware-agnostic model for resource management in Kubernetes, we can establish a native, local metrics-scraping path between Kubelet and DRA drivers.
+Secondary problems that follow from serving accelerator metrics through the native path:
+1. **Metadata correlation is high-privilege and error-prone.** Sidecar exporters must re-associate physical device metrics with Pod/Container identity by querying the Kubelet PodResources API or the API server under elevated privilege. Kubelet already holds this mapping in memory.
+2. **No standard, vendor-neutral shape for autoscaling consumers.** HPA/scheduler consumers today couple to NVIDIA-specific `dcgm` metric names and layouts. A hardware-agnostic contract lets consumers target `nvidia.com/gpu_duty_cycle_ratio` or `google.com/tpu/...` uniformly.
+
+Leveraging DRA — the standard, hardware-agnostic resource model in Kubernetes — we establish a native, local metrics path between Kubelet and DRA drivers that feeds the existing resource-metrics pipeline.
+
+### Why not the existing observability stack?
+
+The most common objection to this KEP is: *"Users already run Prometheus and `dcgm-exporter`, so this isn't needed."* That is true for observability, and this KEP deliberately does not overlap with it. The two serve different consumers:
+
+| Concern | Prometheus + `dcgm-exporter` (existing) | This KEP (`metrics.k8s.io`) |
+|---|---|---|
+| Human dashboards, alerting, long-term storage | **Yes — the right tool.** Keep using it. | No. Explicit non-goal. |
+| Rich/high-cardinality vendor metrics (temperature, ECC errors, NVLink, per-SM stats) | **Yes.** | No. Small hardware-agnostic set only. |
+| Native HPA scaling on GPU/TPU utilization without a custom-metrics adapter | Requires Prometheus + `prometheus-adapter` + `custom.metrics.k8s.io` | **Yes — the core value.** Works through the pipeline HPA already uses. |
+| Metadata correlation without high-privilege PodResources/API scraping | Sidecar must reconstruct identity | **Yes — Kubelet injects it from in-memory state.** |
+| Vendor-neutral metric contract for control loops | Vendor-specific names | **Yes.** |
+
+In short: if you only need dashboards and alerts, you do **not** need this KEP — keep your Prometheus stack. This KEP exists for clusters that want autoscaling and other core control loops to react to accelerator load **without** operating a second metrics pipeline just to bridge that data into HPA.
 
 ### Historical Context (Comparison with KEP-1867)
 
@@ -88,7 +104,8 @@ This proposal (**KEP-6123**) introduces a new collection path that overcomes the
 
 ### Non-Goals
 
-* Defining vendor-specific hardware metrics (e.g., CUDA core count, TPU optical link status, GPU temperature) in Kubelet or Metrics Server APIs.
+* **Replacing or competing with the observability stack.** This is not a substitute for Prometheus, `dcgm-exporter`, or vendor telemetry. Dashboards, alerting, and long-term metric storage remain out of scope and should continue to use those tools.
+* **Serving as a general-purpose hardware telemetry bus.** The native path carries a small, hardware-agnostic set of autoscaling-relevant metrics. Rich or high-cardinality vendor metrics (e.g., CUDA core count, TPU optical link status, GPU temperature, ECC errors, per-SM stats) are explicitly out of scope for the Kubelet/Metrics Server APIs.
 * Designing a metrics collection mechanism for out-of-tree or network-attached resources that bypass Kubelet.
 * Re-implementing existing node-exporter or Prometheus scrape configs.
 
@@ -139,9 +156,6 @@ sequenceDiagram
 ```
 
 ### User Stories
-
-#### Kubernetes AI Operator monitoring GPU/TPU utilization
-As a cluster administrator running ML training jobs, I want to view my GPU and TPU utilization metrics natively without deploying separate dcgm-exporters or custom daemonsets. I want these metrics to be pre-associated with the exact Pod and Container that own the DRA `ResourceClaim`.
 
 #### Horizontal Pod Autoscaler (HPA) scaling on GPU utilization
 As an application developer running inference services, I want to use HPA to scale my deployment up or down based on the average GPU memory utilization or GPU duty cycle of my containers, querying these metrics natively via `metrics.k8s.io`.
@@ -211,7 +225,8 @@ message ClaimMetricsResponse {
   // If non-empty, fetching metrics for the ResourceClaim failed.
   string error = 1;
 
-  // The collected metrics, formatted as OpenMetrics exposition text format.
+  // The collected metrics. Only names in the standardized metric set are accepted;
+  // any other names are dropped by Kubelet.
   // The driver must format the metrics with labels identifying the claim and devices,
   // utilizing the metadata provided in GetMetricsRequest.
   // Example payload:
@@ -262,9 +277,10 @@ A background goroutine in `ResourceMetricsCollector` runs periodically (e.g. eve
 1. **Active Pod Discovery**: Loops through active pods to discover assigned DRA `ResourceClaim`s.
 2. **Group by Driver**: Groups these claims by their managing DRA driver.
 3. **Query Plugins**: For each driver that supports `DRAMetricsCollector`, Kubelet creates a `GetMetricsRequest` and sends it to the driver's local socket with a short timeout (e.g. 2 seconds).
-4. **Validate & Enforce Guardrails**: Kubelet checks the returned `MetricFamily` slice directly to verify the payload schema, dropping any elements that:
-   - Exceed cardinality limits (max 50 metrics, max 10 labels, max 128 character strings).
-   - Violate name prefix constraints (`container_dra_*` or `node_dra_*`).
+4. **Validate Against the Allowed Set**: Kubelet checks the returned `MetricFamily` slice against a fixed allowlist of metric names (see [Standardized Metric Set](#standardized-metric-set)), dropping any element that:
+   - Is not a member of the allowed set.
+   - Has the wrong metric type or unit for its name.
+   - Exceeds cardinality guardrails (max 10 label pairs per metric; max 128 characters for metric names, label keys, and label values).
 5. **Inject Metadata & Update Cache**: Kubelet resolves and injects missing or mismatched core metadata labels (`pod`, `namespace`, `container`, `driver`) using its local pod registry. The validated metrics are stored in a thread-safe local cache, keyed by Pod/Container/Claim.
 
 ##### HTTP Endpoint Serving (Scrape Time)
@@ -276,23 +292,20 @@ When a client queries Kubelet's `/metrics/resource` endpoint:
 Metrics will be dynamically registered at scrape time within the collector's `CollectWithStability` method.
 Descriptors (`metrics.Desc`) for standard metrics will be pre-defined in `resource_metrics.go` to ensure stability metrics categorization.
 
-### OpenMetrics Format & Naming Conventions
+### Standardized Metric Set
 
-Rather than enforcing a strict whitelist of allowed metric names, Kubelet allows DRA drivers to publish arbitrary metrics, provided they adhere to the OpenMetrics standard and the naming conventions below.
+Consistent with the Non-Goal of not being a general-purpose telemetry bus, Kubelet accepts only a **fixed, closed set** of hardware-agnostic accelerator metrics. Drivers may report a subset of these (reporting fewer is valid), but any metric name outside this set is dropped. This keeps the native path narrow, predictable for control-loop consumers, and free of vendor-specific surface. Rich or vendor-specific telemetry must continue to flow through Prometheus/`dcgm-exporter` (see [Why not the existing observability stack?](#why-not-the-existing-observability-stack)).
 
-#### Prefix Constraints
-To prevent metric name collisions with core Kubelet, cAdvisor, and CRI metrics, Kubelet will filter out any metrics that do not carry one of the following prefixes:
-*   `container_dra_`: For container-scoped metrics (requires `pod`, `namespace`, and `container` labels).
-*   `node_dra_`: For node-scoped metrics (does not require pod/container labels).
+#### Allowed Metrics
+All metrics are container-scoped and carry the `container_dra_` prefix (chosen to avoid collisions with core Kubelet, cAdvisor, and CRI metrics). `<resource>` is a driver-declared resource class token (e.g. `gpu`, `tpu`).
 
-#### Recommended Metric Conventions
-To ensure compatibility and consistency across different hardware vendors, driver developers are highly encouraged to map their core resource metrics to the following conventions:
-
-| Convention Metric Name | Type | Unit | Description |
+| Metric Name | Type | Unit | Description |
 |---|---|---|---|
-| `container_dra_<resource>_duty_cycle_ratio` | Gauge | Ratio (0.0-1.0) | Active utilization duty cycle (e.g. `container_dra_gpu_duty_cycle_ratio`). |
-| `container_dra_<resource>_memory_working_set_bytes` | Gauge | Bytes | Active memory usage (e.g. `container_dra_gpu_memory_working_set_bytes`). |
-| `container_dra_<resource>_memory_total_bytes` | Gauge | Bytes | Total available memory (e.g. `container_dra_gpu_memory_total_bytes`). |
+| `container_dra_<resource>_duty_cycle_ratio` | Gauge | Ratio (0.0-1.0) | Active compute utilization duty cycle. |
+| `container_dra_<resource>_memory_working_set_bytes` | Gauge | Bytes | Active accelerator memory in use. |
+| `container_dra_<resource>_memory_total_bytes` | Gauge | Bytes | Total accelerator memory available to the container. |
+
+Kubelet validates that each reported metric matches the expected type and unit for its name. Metrics failing validation are dropped and counted in `dra_metrics_scrape_errors_total`. Adding new metrics to this set is an API change that must go through a KEP update and Metrics API review; it is intentionally not extensible by drivers at runtime.
 
 #### Required Labels
 For Kubelet to accept and expose container-scoped metrics, the driver must label them using the metadata supplied in the `GetMetricsRequest`:
@@ -306,11 +319,11 @@ For Kubelet to accept and expose container-scoped metrics, the driver must label
 
 ### Metrics Server Changes
 
-Because Metrics Server implements the Metrics API using the extensible `ResourceList` type, it can dynamically ingest and expose arbitrary hardware metrics.
+Metrics Server represents accelerator metrics using the `ResourceList` type, populated only with keys derived from the fixed [Standardized Metric Set](#standardized-metric-set).
 
 #### Scrape and Parsing Updates
 Metrics Server's client ([client.go](file:///usr/local/google/home/sizhang/Projects/k8s-core/metrics-server/pkg/scraper/client/resource/client.go)) will scrape `/metrics/resource` as usual.
-The parser in [decode.go](file:///usr/local/google/home/sizhang/Projects/k8s-core/metrics-server/pkg/scraper/client/resource/decode.go) will scan for any metrics carrying the prefix `container_dra_`. It will parse these metrics dynamically, converting the suffix into a resource key under the accelerator's `Usage` map (e.g. `nvidia.com/gpu_temperature_celsius` or `nvidia.com/gpu_duty_cycle_ratio`), and serializing the values as standard K8s `Quantity` types. This ensures any custom metric exposed by a DRA driver is natively available.
+The parser in [decode.go](file:///usr/local/google/home/sizhang/Projects/k8s-core/metrics-server/pkg/scraper/client/resource/decode.go) will match metrics carrying the `container_dra_` prefix against the standardized set, convert the suffix into a resource key under the accelerator's `Usage` map (e.g. `nvidia.com/gpu_duty_cycle_ratio`), and serialize the values as standard K8s `Quantity` types. Metrics not in the standardized set are ignored.
 
 #### Metrics API Extension (metrics.k8s.io/v1beta2)
 We propose extending the metrics schema in Metrics Server to support a new API version `metrics.k8s.io/v1beta2`.
@@ -346,17 +359,19 @@ type AcceleratorMetrics struct {
 ```
 If a pod uses multiple devices of different resource classes, Metrics Server aggregates the stats for each device separately.
 
-#### Dynamic Metrics Mapping to ResourceList
-To support arbitrary metrics without API schema updates, Metrics Server will dynamically translate Kubelet's exposed metrics into `ResourceList` keys using the following rules:
+#### Metrics Mapping to ResourceList
+Metrics Server maps the fixed [Standardized Metric Set](#standardized-metric-set) into `ResourceList` keys using the following rules:
 
-1. **Key Generation**: A metric named `container_dra_<metric_suffix>` from driver `<driver_name>` will be exposed under `Usage` with the key `<driver_name>/<metric_suffix>`.
-   - E.g., `container_dra_gpu_duty_cycle_ratio` from driver `nvidia.com` is mapped to `nvidia.com/gpu_duty_cycle_ratio`.
-   - E.g., `container_dra_tpu_hbm_temperature` from driver `google.com/tpu` is mapped to `google.com/tpu/hbm_temperature`.
-2. **Value Representation**: Since `ResourceList` values must be of type `Quantity`, floating-point metrics (like ratios) will be represented using standard milli-units (e.g., `0.85` becomes `850m`). Integers (like bytes or counts) will be represented directly as standard quantities.
+1. **Key Generation**: A metric named `container_dra_<metric_suffix>` from driver `<driver_name>` is exposed under `Usage` with the key `<driver_name>/<metric_suffix>`.
+   - E.g., `container_dra_gpu_duty_cycle_ratio` from driver `nvidia.com` maps to `nvidia.com/gpu_duty_cycle_ratio`.
+   - E.g., `container_dra_tpu_memory_working_set_bytes` from driver `google.com/tpu` maps to `google.com/tpu/tpu_memory_working_set_bytes`.
+2. **Value Representation**: Since `ResourceList` values must be of type `Quantity`, ratio metrics are represented using standard milli-units (e.g., `0.85` becomes `850m`). Byte metrics are represented directly as standard quantities.
+
+Because the metric set is fixed, the set of possible `Usage` keys is bounded and known ahead of time; Metrics Server does not ingest arbitrary driver-defined keys.
 
 #### Autoscaling with HPA
 
-This dynamic mapping enables the Horizontal Pod Autoscaler (HPA) to scale on *any* arbitrary hardware metric exposed by a DRA driver natively through the resource metrics pipeline, without requiring an external metrics adapter (e.g. Prometheus Adapter) or modifications to the HPA controller.
+This mapping enables the Horizontal Pod Autoscaler (HPA) to scale on the standardized accelerator metrics natively through the resource metrics pipeline, without requiring an external metrics adapter (e.g. Prometheus Adapter) or modifications to the HPA controller.
 
 ##### HPA Resource Metric Target Example
 Below is an HPA configuration scaling based on the dynamic GPU duty cycle metric of a container:
@@ -466,4 +481,4 @@ This integration functions out of the box because of the following core design d
 * **How can a user debug if metrics are missing?**
   1. Check if the DRA driver pod is running and registers the socket.
   2. Verify that Kubelet logs contain "Registered DRA plugin with metrics collection capability".
-  3. Query Kubelet's `/metrics/resource` endpoint directly on the node to check if the `container_accelerator_*` metrics are populated.
+  3. Query Kubelet's `/metrics/resource` endpoint directly on the node to check if the `container_dra_*` metrics are populated.
